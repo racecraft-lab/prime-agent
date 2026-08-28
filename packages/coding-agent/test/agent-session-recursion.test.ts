@@ -1692,6 +1692,69 @@ describe("AgentSession rlm recursion", () => {
 		await Promise.all([childABash, childBBash]);
 	});
 
+	it("keeps root quiescence alive when one retained child is explicitly deleted", async () => {
+		const survivorStarted = deferred<void>();
+		const survivorCompletion = deferred<void>();
+		const survivor = createSession({ rlmSessionDir: join(tempDir, "selective-delete-survivor") });
+		const survivorBash = survivor.executeBash("survivor-gate", undefined, {
+			operations: {
+				exec: async () => {
+					survivorStarted.resolve();
+					await survivorCompletion.promise;
+					return { exitCode: 0 };
+				},
+			},
+		});
+		const cancelledStarted = deferred<void>();
+		const cancelledCompletion = deferred<void>();
+		const cancelled = createSession({ rlmSessionDir: join(tempDir, "selective-delete-cancelled") });
+		const cancelledBash = cancelled
+			.executeBash("cancelled-gate", undefined, {
+				operations: {
+					exec: async () => {
+						cancelledStarted.resolve();
+						await cancelledCompletion.promise;
+						return { exitCode: 0 };
+					},
+				},
+			})
+			.catch(() => undefined);
+		await Promise.all([survivorStarted.promise, cancelledStarted.promise]);
+
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => {
+					throw new Error("unexpected child creation");
+				},
+				deleteRlmSubagentRuntime: async (_id, session) => session?.disposeAsync(),
+			},
+		});
+		expect(root.registerRlmChildSession("survivor-child", survivor)).toBe(true);
+		expect(root.registerRlmChildSession("cancelled-child", cancelled)).toBe(true);
+
+		const quiescence = root.waitForRlmQuiescence();
+		await vi.waitFor(() => {
+			expect((survivor as unknown as InspectableRlmSession)._rlmQuiescenceWaitAborts.size).toBe(1);
+			expect((cancelled as unknown as InspectableRlmSession)._rlmQuiescenceWaitAborts.size).toBe(1);
+		});
+		await root.deleteRlmSubagent("cancelled-child");
+
+		const selectiveBoundary = await Promise.race([
+			quiescence.then(
+				() => "resolved" as const,
+				(error: unknown) => `rejected:${error instanceof Error ? error.message : String(error)}` as const,
+			),
+			sleep(20).then(() => "survivor-active" as const),
+		]);
+		expect(selectiveBoundary).toBe("survivor-active");
+
+		survivorCompletion.resolve();
+		await survivorBash;
+		await expect(quiescence).resolves.toBeUndefined();
+		cancelledCompletion.resolve();
+		await cancelledBash;
+	});
+
 	it("durably defers a child terminal notice across ACP-style input pause and scheduler suspension", async () => {
 		const childStarted = deferred<void>();
 		const childCompletion = deferred<void>();
