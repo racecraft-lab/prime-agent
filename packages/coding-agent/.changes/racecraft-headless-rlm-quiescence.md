@@ -1,0 +1,1 @@
+- Fixed single-shot modes exiting before RLM descendant results and their parent follow-up turns completed.

@@ -10,7 +10,7 @@ import {
 } from "../src/core/messages.js";
 import type { SessionShutdownEvent } from "../src/index.js";
 import { selectHeadlessTerminalResult } from "../src/modes/headless-completion.js";
-import { runPrintMode } from "../src/modes/print-mode.js";
+import { runPrintMode, runPrintModeWithConnection } from "../src/modes/print-mode.js";
 
 const output = vi.hoisted(() => ({ write: vi.fn(), flush: vi.fn(async () => {}) }));
 vi.mock("../src/core/output-guard.js", () => ({
@@ -33,6 +33,7 @@ type FakeSession = {
 	agent: { waitForIdle: ReturnType<typeof vi.fn<() => Promise<void>>> };
 	waitForIdle: ReturnType<typeof vi.fn<() => Promise<void>>>;
 	waitForHeadlessIdle: ReturnType<typeof vi.fn<() => Promise<void>>>;
+	waitForRlmQuiescence: ReturnType<typeof vi.fn<() => Promise<void>>>;
 	state: { messages: AgentMessage[] };
 	messages: AgentMessage[];
 	extensionRunner: FakeExtensionRunner;
@@ -105,6 +106,7 @@ function createRuntimeHost(
 		agent: { waitForIdle: vi.fn(async () => {}) },
 		waitForIdle,
 		waitForHeadlessIdle: waitForIdle,
+		waitForRlmQuiescence: waitForIdle,
 		state,
 		messages: state.messages,
 		extensionRunner,
@@ -135,6 +137,33 @@ afterEach(() => {
 });
 
 describe("runPrintMode", () => {
+	it("waits for RLM quiescence before completing single-shot output", async () => {
+		const autonomousStatus: AgentAutonomousStatus = {
+			enabled: false,
+			continuationsUsed: 0,
+			turnsUsed: 0,
+			tokensUsed: 0,
+			limits: { maxContinuations: 3, maxTurns: 12, maxTokens: 80_000, timeoutMs: 1_800_000 },
+			gates: { commands: [], maxRetries: 3, timeoutMs: 300_000 },
+			gateAttempts: {},
+		};
+		const waitForHeadlessCompletion = vi.fn(async () => autonomousStatus);
+		const connection = {
+			subscribe: vi.fn(() => () => {}),
+			waitForHeadlessCompletion,
+			getMessages: vi.fn(async () => [createAssistantMessage({ text: "done" })]),
+			dispose: vi.fn(async () => {}),
+		};
+
+		const exitCode = await runPrintModeWithConnection(
+			connection as unknown as Parameters<typeof runPrintModeWithConnection>[0],
+			{ mode: "text" },
+		);
+
+		expect(exitCode).toBe(0);
+		expect(waitForHeadlessCompletion).toHaveBeenCalledWith({ waitForRlmQuiescence: true });
+	});
+
 	it("emits session_shutdown in text mode", async () => {
 		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "done" }));
 		const { session } = runtimeHost;

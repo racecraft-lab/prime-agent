@@ -9993,22 +9993,30 @@ export class AgentSession {
 		return false;
 	}
 
-	private _rlmChildSessionSnapshot(): AgentSession[] {
-		const sessions = new Set<AgentSession>();
+	private _rlmChildSessionSnapshot(): Array<{ childId: string; session: AgentSession }> {
+		const sessions = new Map<AgentSession, string>();
 		for (const [childId, session] of this._rlmChildSessions) {
-			if (!this._abandonedRlmQuiescenceChildIds.has(childId)) sessions.add(session);
+			if (!this._abandonedRlmQuiescenceChildIds.has(childId)) sessions.set(session, childId);
 		}
 		for (const run of this._activeRlmChildRuns.values()) {
-			if (run.session && !run.abandonedForQuiescence) sessions.add(run.session);
+			if (run.session && !run.abandonedForQuiescence) sessions.set(run.session, run.id);
 		}
-		return [...sessions];
+		return [...sessions].map(([session, childId]) => ({ childId, session }));
 	}
 
 	private _hasUnsettledRlmQuiescenceWork(): boolean {
 		if (this._hasDeferredRlmTerminalNotices()) return true;
 		if ([...this._unsettledRlmChildRuns].some((run) => !run.settled)) return true;
 		return this._rlmChildSessionSnapshot().some(
-			(child) => child.isSessionActive || child._hasUnsettledRlmQuiescenceWork(),
+			({ session }) => session.isSessionActive || session._hasUnsettledRlmQuiescenceWork(),
+		);
+	}
+
+	private _isRlmSubagentDeletionAdmitted(childId: string): boolean {
+		return (
+			this._deletingRlmChildren.has(childId) ||
+			this._deletedRlmChildIds.has(childId) ||
+			this._activeRlmChildRuns.get(childId)?.detachedDeletion !== undefined
 		);
 	}
 
@@ -10048,7 +10056,17 @@ export class AgentSession {
 				await wait(
 					Promise.all([
 						...unsettledRuns.map((run) => run.settlement.promise),
-						...childSessions.map((child) => child.waitForRlmQuiescence(cancellation.signal)),
+						...childSessions.map(async ({ childId, session }) => {
+							try {
+								await session.waitForRlmQuiescence(cancellation.signal);
+							} catch (error) {
+								// Explicit deletion owns this child's teardown. Disposal aborts the
+								// child's local waiter, but must not cancel surviving siblings or the
+								// root barrier. The run settlement still keeps deletion cleanup joined.
+								if (this._isRlmSubagentDeletionAdmitted(childId)) return;
+								throw error;
+							}
+						}),
 					]),
 				);
 				// Always loop through the self-active/deferred checks again. Work may

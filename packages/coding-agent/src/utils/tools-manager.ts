@@ -1,6 +1,5 @@
 import chalk from "chalk";
 import { spawnSync } from "child_process";
-import extractZip from "extract-zip";
 import { chmodSync, createWriteStream, existsSync, mkdirSync, readdirSync, renameSync, rmSync } from "fs";
 import { arch, platform } from "os";
 import { join } from "path";
@@ -16,7 +15,12 @@ const RIPGREP_INSTALL_URL = "https://github.com/BurntSushi/ripgrep#installation"
 
 export type ManagedTool = "fd" | "rg";
 
-export type ToolUnavailableReason = "offline" | "manual_install_required" | "unsupported_platform" | "download_failed";
+export type ToolUnavailableReason =
+	| "offline"
+	| "manual_install_required"
+	| "unsupported_platform"
+	| "zip_provisioning_disabled"
+	| "download_failed";
 
 export interface ToolAvailableResult {
 	status: "available";
@@ -186,6 +190,7 @@ function findBinaryRecursively(rootDir: string, binaryFileName: string): string 
 
 // Download and install a tool
 class UnsupportedToolPlatformError extends Error {}
+class ZipProvisioningDisabledError extends Error {}
 
 async function downloadTool(tool: ManagedTool): Promise<string> {
 	const config = TOOLS[tool];
@@ -194,8 +199,14 @@ async function downloadTool(tool: ManagedTool): Promise<string> {
 	const plat = platform();
 	const architecture = arch();
 
-	if (!config.getAssetName("VERSION", plat, architecture)) {
+	const assetPattern = config.getAssetName("VERSION", plat, architecture);
+	if (!assetPattern) {
 		throw new UnsupportedToolPlatformError(`Unsupported platform: ${plat}/${architecture}`);
+	}
+	if (assetPattern.endsWith(".zip")) {
+		throw new ZipProvisioningDisabledError(
+			`Automatic ZIP provisioning is disabled in the Racecraft fork; install ${config.name} manually`,
+		);
 	}
 
 	// Get latest version and the matching platform asset.
@@ -229,8 +240,6 @@ async function downloadTool(tool: ManagedTool): Promise<string> {
 				const errMsg = extractResult.error?.message ?? extractResult.stderr?.toString().trim() ?? "unknown error";
 				throw new Error(`Failed to extract ${assetName}: ${errMsg}`);
 			}
-		} else if (assetName.endsWith(".zip")) {
-			await extractZip(archivePath, { dir: extractDir });
 		} else {
 			throw new Error(`Unsupported archive format: ${assetName}`);
 		}
@@ -303,6 +312,9 @@ export function formatMissingRipgrepMessage(result: ToolUnavailableResult): stri
 		case "unsupported_platform":
 			reason = `Automatic installation is unavailable for ${result.platform}/${result.architecture}.`;
 			break;
+		case "zip_provisioning_disabled":
+			reason = "Automatic ZIP provisioning is disabled in the Racecraft fork.";
+			break;
 		case "download_failed": {
 			const detail = result.detail?.replace(/\s+/g, " ").trim();
 			reason = detail
@@ -367,9 +379,12 @@ export async function ensureToolWithStatus(tool: ManagedTool, silent: boolean = 
 		if (!silent) {
 			console.log(chalk.yellow(`Failed to download ${config.name}: ${e instanceof Error ? e.message : e}`));
 		}
+		let reason: ToolUnavailableReason = "download_failed";
+		if (e instanceof UnsupportedToolPlatformError) reason = "unsupported_platform";
+		if (e instanceof ZipProvisioningDisabledError) reason = "zip_provisioning_disabled";
 		return {
 			status: "unavailable",
-			reason: e instanceof UnsupportedToolPlatformError ? "unsupported_platform" : "download_failed",
+			reason,
 			platform: platformName,
 			architecture,
 			detail: e instanceof Error ? e.message : String(e),
