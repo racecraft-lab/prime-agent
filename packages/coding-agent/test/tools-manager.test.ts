@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -6,7 +6,6 @@ const toolState = vi.hoisted(() => ({
 	toolsDir: `/tmp/prime-agent-tools-manager-${process.pid}`,
 	platform: "linux",
 	architecture: "x64",
-	extractZip: async (_source: string, _options: { dir: string }): Promise<void> => {},
 }));
 
 vi.mock("../src/config.js", () => ({
@@ -17,10 +16,6 @@ vi.mock("../src/config.js", () => ({
 vi.mock("os", () => ({
 	arch: () => toolState.architecture,
 	platform: () => toolState.platform,
-}));
-
-vi.mock("extract-zip", () => ({
-	default: (source: string, options: { dir: string }) => toolState.extractZip(source, options),
 }));
 
 import {
@@ -54,7 +49,6 @@ describe("tools manager", () => {
 		delete process.env.PI_OFFLINE;
 		toolState.platform = "linux";
 		toolState.architecture = "x64";
-		toolState.extractZip = async () => {};
 	});
 
 	afterEach(() => {
@@ -116,48 +110,24 @@ describe("tools manager", () => {
 		});
 	});
 
-	it("validates a downloaded binary before reporting it available", async () => {
+	it("fails closed before ZIP download and preserves an existing symlink target", async () => {
 		toolState.platform = "win32";
-		writeExecutable(join(toolState.toolsDir, "rg.exe"), 1);
-		const fetchMock = vi
-			.fn()
-			.mockResolvedValueOnce(
-				new Response(JSON.stringify({ tag_name: "15.1.0" }), {
-					status: 200,
-					headers: { "Content-Type": "application/json" },
-				}),
-			)
-			.mockResolvedValueOnce(new Response(new Uint8Array([1]), { status: 200 }));
+		const targetPath = join(toolState.toolsDir, "outside-rg-target");
+		const managedPath = join(toolState.toolsDir, "rg.exe");
+		writeExecutable(targetPath, 1);
+		const originalTarget = readFileSync(targetPath, "utf8");
+		symlinkSync(targetPath, managedPath);
+		const fetchMock = vi.fn();
 		vi.stubGlobal("fetch", fetchMock);
-		toolState.extractZip = async (_source, options) => {
-			writeExecutable(join(options.dir, "rg.exe"));
-		};
-
-		await expect(ensureToolWithStatus("rg")).resolves.toEqual({
-			status: "available",
-			path: join(toolState.toolsDir, "rg.exe"),
-		});
-		expect(fetchMock).toHaveBeenCalledTimes(2);
-	});
-
-	it("removes a downloaded binary that fails its version check", async () => {
-		toolState.platform = "win32";
-		vi.stubGlobal(
-			"fetch",
-			vi
-				.fn()
-				.mockResolvedValueOnce(new Response(JSON.stringify({ tag_name: "15.1.0" }), { status: 200 }))
-				.mockResolvedValueOnce(new Response(new Uint8Array([1]), { status: 200 })),
-		);
-		toolState.extractZip = async (_source, options) => {
-			writeExecutable(join(options.dir, "rg.exe"), 1);
-		};
 
 		await expect(ensureToolWithStatus("rg")).resolves.toMatchObject({
 			status: "unavailable",
-			reason: "download_failed",
+			reason: "zip_provisioning_disabled",
+			platform: "win32",
 		});
-		expect(existsSync(join(toolState.toolsDir, "rg.exe"))).toBe(false);
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(lstatSync(managedPath).isSymbolicLink()).toBe(true);
+		expect(readFileSync(targetPath, "utf8")).toBe(originalTarget);
 	});
 
 	it("formats actionable platform-specific ripgrep warnings", () => {
